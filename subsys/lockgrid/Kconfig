@@ -1,0 +1,483 @@
+# Copyright (c) 2026 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig LOCKGRID
+	bool "LockGrid low power mesh"
+	depends on SOC_SERIES_NRF54LX || SOC_SERIES_BSIM_NRF54LX
+	select ENTROPY_GENERATOR
+	select EVENTS
+	help
+	  LockGrid is a scheduled-rendezvous 2.4 GHz mesh built directly on the
+	  RADIO peripheral. Nodes hold periodic connection events with a small
+	  set of authenticated neighbours and route towards backhaul nodes.
+
+if LOCKGRID
+
+module = LOCKGRID
+module-str = LockGrid
+source "subsys/logging/Kconfig.template.log_config"
+
+comment "Radio access"
+
+choice LOCKGRID_RADIO_BACKEND
+	prompt "Radio arbitration"
+	default LOCKGRID_RADIO_MPSL if MPSL
+	default LOCKGRID_RADIO_DIRECT
+	help
+	  How LockGrid obtains the RADIO peripheral.
+
+config LOCKGRID_RADIO_DIRECT
+	bool "Own the radio directly"
+	help
+	  LockGrid owns RADIO and one GRTC compare channel outright. Lowest
+	  overhead and exact timing, but nothing else may use the radio.
+
+config LOCKGRID_RADIO_MPSL
+	bool "Arbitrate through MPSL timeslots"
+	depends on MPSL
+	select MPSL_TIMESLOT_SESSION_COUNT_NONZERO
+	help
+	  Each LockGrid radio event is requested as an MPSL timeslot, so
+	  LockGrid can run alongside Bluetooth LE. Slots the arbiter refuses
+	  are reported as blocked and folded into the link quality metrics.
+
+endchoice
+
+config MPSL_TIMESLOT_SESSION_COUNT_NONZERO
+	bool
+	help
+	  Helper to make sure MPSL reserves a timeslot context for LockGrid.
+
+config LOCKGRID_TS_REFUSE_PERMILLE
+	int "Synthetically refuse this fraction of radio requests"
+	depends on LOCKGRID_RADIO_DIRECT
+	range 0 900
+	default 0
+	help
+	  Makes the direct arbiter reject the given fraction of requests, in tenths
+	  of a percent, reporting them exactly as MPSL reports a blocked or
+	  cancelled timeslot.
+
+	  This exists because MPSL cannot run under BabbleSim, so the one thing that
+	  actually needs proving about sharing the radio - that the protocol never
+	  assumes it will get the time it asked for - cannot be tested against MPSL
+	  itself. With this set, every layer above sees refusals at a realistic rate
+	  and the links, the routing metric and the handshakes have to cope. Leave it
+	  at zero for anything but that test.
+
+config LOCKGRID_TIMESLOT_MARGIN_US
+	int "Timeslot length margin"
+	depends on LOCKGRID_RADIO_MPSL
+	range 50 5000
+	default 400
+	help
+	  Extra length requested on top of the computed radio activity, to
+	  absorb arbitration jitter and the cost of ending the slot.
+
+comment "PHY"
+
+config LOCKGRID_TX_POWER_DBM
+	int "Transmit power"
+	range -46 8
+	default 0
+
+config LOCKGRID_EARLY_ABORT
+	bool "Abort receive early on a foreign header"
+	default y if !SOC_SERIES_BSIM_NRF54LX
+	help
+	  Uses the radio bit counter to inspect the network id and destination as
+	  they arrive and stop the receiver mid-frame when the frame is not for us.
+	  A full 125 byte frame is 4.3 ms of receive; bailing out after the header
+	  costs under 400 us, so this removes most of the cost of overheard
+	  traffic. It is the same technique Nordic's 802.15.4 driver uses for
+	  frame filtering.
+
+	  It depends on EasyDMA filling the receive buffer as the bytes arrive,
+	  which hardware does. The BabbleSim RADIO model writes the payload to
+	  memory only at packet end, so when the bit counter fires the header is
+	  not in memory yet and the filter rejects frames it should accept.
+	  Defaulted off on the simulated board for that reason, which is why the
+	  simulated receive figures for overheard traffic are pessimistic relative
+	  to hardware.
+
+comment "Topology"
+
+config LOCKGRID_MAX_NEIGHBORS
+	int "Neighbour table size"
+	range 2 32
+	default 8
+
+config LOCKGRID_MAX_LINKS
+	int "Concurrent scheduled links"
+	range 1 16
+	default 4
+	help
+	  Each link costs a periodic receive window, so this is the main knob
+	  on steady-state current for a router.
+
+config LOCKGRID_MAX_PARENTS
+	int "Uplinks kept towards the backhaul"
+	range 1 4
+	default 2
+	help
+	  More than one parent lets a node fail over without a new handshake.
+
+config LOCKGRID_ROUTER_DENSITY_TARGET
+	int "Routers a node wants to hear before it stays a leaf"
+	range 1 8
+	default 2
+	help
+	  Drives the runtime leaf-versus-router decision. A node with a route that
+	  hears fewer routers than this promotes itself, because the area is thin
+	  and its neighbours may have nowhere to attach; one that hears more than
+	  this, and has nothing routing through it, gives the role back.
+
+	  Higher values buy redundancy at the cost of more nodes paying a router's
+	  energy. Lower values leave a sparser tree that heals more slowly.
+
+config LOCKGRID_MAX_ROUTES
+	int "Downward routing table size"
+	range 0 64
+	default 16
+
+config LOCKGRID_TX_QUEUE_SIZE
+	int "Queued outbound messages"
+	range 2 64
+	default 8
+
+comment "Timing"
+
+config LOCKGRID_CONN_INTERVAL_MS
+	int "Default connection interval"
+	range 20 4000
+	default 200
+
+config LOCKGRID_CONN_INTERVAL_MIN_MS
+	int "Shortest connection interval a link may negotiate"
+	range 10 4000
+	default 50
+
+config LOCKGRID_CONN_INTERVAL_MAX_MS
+	int "Longest connection interval a link may negotiate"
+	range 20 32000
+	default 2000
+
+config LOCKGRID_SUBRATE_MAX
+	int "Largest subrate factor"
+	range 1 32
+	default 16
+	help
+	  When both ends of an idle link have nothing queued they use only every
+	  Nth event, keeping enough to hold synchronisation.
+
+	  This is the largest single lever on steady-state current, because a
+	  skipped event costs nothing at all - not just no air time, but none of
+	  the ~1.3 uC fixed cost of starting the radio, which is a sixth of an
+	  idle event. Going from every event to every sixteenth takes a link from
+	  roughly 41 uA to under 3 uA.
+
+	  It is clamped at runtime against the supervision timeout: events spaced
+	  further apart than the timeout can tolerate would make a healthy link
+	  die on its first collision.
+
+config LOCKGRID_SUPERVISION_TIMEOUT_MS
+	int "Link supervision timeout"
+	range 500 60000
+	default 20000
+	help
+	  How long a link may go without a successful exchange before it is torn
+	  down. This bounds how quickly a lost neighbour is noticed, and it also
+	  bounds the subrate: a link cannot back off so far that it has no chance
+	  to prove it is alive within the timeout. Raising it buys a lower duty
+	  cycle at the cost of slower healing, which is the main trade available
+	  through lg_tuning_set().
+
+config LOCKGRID_CLOCK_ACCURACY_PPM
+	int "Sleep clock accuracy"
+	range 1 500
+	default 250
+	help
+	  Drives receive window widening. A tighter clock directly reduces the
+	  time a node spends listening for each connection event.
+
+config LOCKGRID_RX_WINDOW_MIN_US
+	int "Smallest receive window"
+	range 100 5000
+	default 200
+	help
+	  The floor a window collapses to after a successful synchronisation.
+	  Measured synchronisation error on a healthy link is a microsecond or
+	  two, so this only has to cover interrupt latency and the peer's
+	  transmit chain. Every microsecond here is paid on every event of every
+	  link, so it is the most leveraged number in the protocol.
+
+config LOCKGRID_RX_WINDOW_MAX_US
+	int "Largest receive window"
+	range 500 60000
+	default 8000
+
+config LOCKGRID_EVENT_MAX_LEN_US
+	int "Longest a connection event may run"
+	range 1000 50000
+	default 6000
+	help
+	  Bounds how many frames the two ends may chain within one event when
+	  either has more data pending.
+
+comment "Discovery"
+
+config LOCKGRID_BEACON_INTERVAL_MS
+	int "Nominal beacon interval for routers"
+	range 100 60000
+	default 500
+	help
+	  Jittered by plus or minus 25% so neighbouring routers do not fall into
+	  lockstep. Transmitting is cheap next to the receive time a joiner has
+	  to spend, so beaconing often is the right side of the trade.
+
+config LOCKGRID_JOIN_WINDOW_FLOOR_MS
+	int "Longest a router may go without opening a join window"
+	range 1000 600000
+	default 30000
+	help
+	  A router normally opens a join window only when it wants links or has
+	  heard an unlinked node beaconing. Neither is true when a settled grid is
+	  approached by a leaf, because leaves do not beacon - so without a floor
+	  the leaf could never get in. This bounds the worst-case join latency for
+	  such a node at roughly this period.
+
+config LOCKGRID_BEACON_IDLE_FACTOR
+	int "Beacon interval multiplier when no joiner has been heard"
+	range 1 64
+	default 16
+	help
+	  Once every node in earshot is linked, beacons are the largest single
+	  consumer of radio time and nobody is listening to them. This stretches
+	  the interval until an unlinked node is heard again.
+
+config LOCKGRID_BEACON_SUPPRESS_THRESHOLD
+	int "Beacons heard that suppress our own"
+	range 0 16
+	default 3
+	help
+	  Trickle-style density control: a router stays quiet for an interval
+	  if it already heard this many beacons from better-connected peers.
+
+config LOCKGRID_SCAN_WINDOW_US
+	int "Length of one scan window"
+	range 1000 500000
+	default 30000
+	help
+	  Must comfortably exceed the span of one beacon event, which is three
+	  copies plus the gaps between them, or a scan can straddle a beacon and
+	  hear none of it.
+
+config LOCKGRID_SCAN_INTERVAL_UNATTACHED_MS
+	int "Scan period while unattached"
+	range 20 10000
+	default 50
+	help
+	  With the default window this is a duty cycle over 50%, which is
+	  deliberate: an unattached node has nothing else to spend energy on, and
+	  the sooner it is attached the sooner it drops to the settled rate.
+
+config LOCKGRID_SCAN_INTERVAL_SEEKING_MS
+	int "Scan period once routed but short of the link target"
+	range 100 60000
+	default 3000
+	help
+	  A node in this state is already carrying traffic, so redundancy is
+	  worth having but not worth a high duty cycle. If no second router is
+	  in range, an aggressive rate would burn energy for nothing.
+
+config LOCKGRID_SCAN_INTERVAL_ATTACHED_MS
+	int "Scan period once attached and routed"
+	range 1000 600000
+	default 60000
+	help
+	  Once a node has a route it learns about new neighbours from gossip
+	  over existing links, so scanning drops to an occasional sanity check.
+
+config LOCKGRID_MAX_RANK
+	int "Rank at which a path is treated as unreachable"
+	range 64 32768
+	default 512
+	help
+	  Rank is the accumulated cost to a backhaul, and a one-hop link on a good
+	  channel costs 16. This ceiling bounds how deep a path may be, but its real
+	  job is to bound a routing loop: the acyclicity rule only inspects the
+	  immediate neighbour, so a loop longer than one hop inflates ranks instead
+	  of being rejected. This stops that inflation running to infinity, but it
+	  does not make it quick - see the note in lg_route.c. Keep it well above the
+	  deepest path the deployment can legitimately have; 512 is 32 perfect hops,
+	  against about 130 for the hundred-node clustered scenario.
+
+config LOCKGRID_MIN_LINKS_TARGET
+	int "Links a node tries to hold before it stops scanning hard"
+	range 1 8
+	default 2
+
+comment "Channels"
+
+config LOCKGRID_CHAN_EVAL_PERIOD_MS
+	int "Channel map re-evaluation period"
+	range 1000 3600000
+	default 30000
+
+config LOCKGRID_CHAN_MIN_GOOD
+	int "Fewest channels the map may shrink to"
+	range 2 16
+	default 4
+
+config LOCKGRID_CHAN_BAD_PER_PERMILLE
+	int "Error rate that retires a channel"
+	range 10 900
+	default 300
+
+config LOCKGRID_CHAN_GOOD_PER_PERMILLE
+	int "Error rate that brings a channel back"
+	range 5 500
+	default 150
+
+config LOCKGRID_CHAN_NOISE_FLOOR_DBM
+	int "Noise floor above which a channel is considered occupied"
+	range -110 -30
+	default -75
+
+comment "Security"
+
+config LOCKGRID_MIC_LEN
+	int "Message integrity check length"
+	range 4 16
+	default 4
+	help
+	  Bytes of AES-CCM tag carried on every frame.
+
+config LOCKGRID_REPLAY_WINDOW
+	int "Accepted reordering depth for the replay filter"
+	range 1 64
+	default 16
+
+config LOCKGRID_SIM_PROVISIONING
+	bool "Generate a certificate at boot from a built-in test CA"
+	default y if SOC_SERIES_BSIM_NRF54LX
+	help
+	  Simulation and bring-up convenience: derives a key pair for this
+	  node and signs a certificate with a compiled-in CA key, so the real
+	  certificate verification path is exercised without a provisioning
+	  step. Never enable this on a product.
+
+comment "Instrumentation"
+
+config LOCKGRID_TRACE
+	bool "Emit a machine-readable event trace"
+	help
+	  Prints one LGT-prefixed line per protocol event, each carrying its own
+	  microsecond timestamp, for offline analysis and the topology
+	  visualisation. Uses printk directly so a line is atomic even when
+	  emitted from the radio interrupt.
+
+config LOCKGRID_TRACE_FRAMES
+	bool "Include every frame in the trace"
+	depends on LOCKGRID_TRACE
+	default y
+	help
+	  Adds a line per transmitted and received frame. This is the bulk of the
+	  output - with a hundred nodes it dominates - so it can be turned off
+	  when only topology and routing behaviour is of interest.
+
+config LOCKGRID_POWER_ACCOUNTING
+	bool "Account radio energy per activity"
+	default y
+
+if LOCKGRID_POWER_ACCOUNTING
+
+# Currents and durations for the energy model. Defaults are nRF54L15 figures at
+# 0 dBm; override them to match your own measurements.
+#
+# The fixed cost of starting the radio dominates a short event and is easy to
+# leave out of a model: pre-processing, crystal ramp, settling, starting the
+# radio and the turnaround between transmit and receive together come to about
+# 1.3 uC, against roughly 3.8 uC for the air time of a keepalive. A model that
+# only charges air time understates an idle connection event by a sixth, and
+# understates the value of skipping one entirely by far more.
+
+config LOCKGRID_PWR_TX_UA
+	int "Current while transmitting, in microamps"
+	default 5000
+
+config LOCKGRID_PWR_RX_UA
+	int "Current while receiving, in microamps"
+	default 3200
+
+config LOCKGRID_PWR_PRE_UA
+	int "Pre-processing current, in microamps"
+	default 2200
+
+config LOCKGRID_PWR_PRE_US
+	int "Pre-processing duration, in microseconds"
+	default 13
+
+config LOCKGRID_PWR_XTAL_UA
+	int "Crystal ramp current, in microamps"
+	default 1000
+
+config LOCKGRID_PWR_XTAL_US
+	int "Crystal ramp duration, in microseconds"
+	default 380
+
+config LOCKGRID_PWR_HFXO_ALWAYS_ON
+	bool "Assume the high frequency crystal stays running between events"
+	help
+	  Drops the crystal ramp and settle from every event, worth a little over
+	  half the fixed cost. Only true if something keeps HFXO running, which is
+	  a trade worth making only at intervals short enough that the ramp is
+	  being paid more often than the crystal's own standby current.
+
+config LOCKGRID_PWR_SETTLE_UA
+	int "Standby current while settling, in microamps"
+	default 600
+
+config LOCKGRID_PWR_SETTLE_US
+	int "Settling duration, in microseconds"
+	default 500
+
+config LOCKGRID_PWR_START_UA
+	int "Current while starting the radio, in microamps"
+	default 2400
+
+config LOCKGRID_PWR_START_US
+	int "Radio start duration, in microseconds"
+	default 100
+
+config LOCKGRID_PWR_SWITCH_UA
+	int "Current during a transmit to receive turnaround, in microamps"
+	default 1200
+
+config LOCKGRID_PWR_SWITCH_US
+	int "Turnaround duration, in microseconds"
+	default 143
+
+config LOCKGRID_PWR_STANDBY_UA
+	int "Standby current between the two halves of an event, in microamps"
+	default 2900
+
+config LOCKGRID_PWR_STANDBY_US
+	int "That standby duration, in microseconds"
+	default 58
+
+config LOCKGRID_PWR_SLEEP_NA
+	int "System current between radio events, in nanoamps"
+	default 1500
+
+endif # LOCKGRID_POWER_ACCOUNTING
+
+config LOCKGRID_WORKQ_STACK_SIZE
+	int "LockGrid work queue stack size"
+	default 4096
+
+config LOCKGRID_WORKQ_PRIO
+	int "LockGrid work queue priority"
+	default 5
+
+endif # LOCKGRID
