@@ -1,0 +1,6 @@
+name: lockgrid
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    board_root: .

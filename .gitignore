@@ -1,0 +1,9 @@
+# Zephyr and BabbleSim build trees
+build*/
+
+# Python tooling caches
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
